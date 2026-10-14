@@ -12,6 +12,7 @@ from typing import Any, cast
 from urllib.parse import urlparse
 
 import joblib
+import pandas as pd
 import streamlit as st
 from tavily import TavilyClient
 
@@ -228,6 +229,187 @@ init_db()
 
 
 # =========================================================
+# OWNER LOGIN AND ADMIN REVIEW
+# =========================================================
+
+def owner_credentials():
+    """Read owner credentials from Streamlit Secrets, never hard-code them."""
+    try:
+        owner_email = str(st.secrets.get("OWNER_EMAIL", "")).strip()
+        owner_password = str(st.secrets.get("OWNER_PASSWORD", ""))
+    except Exception:
+        owner_email = ""
+        owner_password = ""
+    return owner_email, owner_password
+
+
+def authenticate_owner(email: str, password: str) -> bool:
+    configured_email, configured_password = owner_credentials()
+    if not configured_email or not configured_password:
+        return False
+    return (
+        hmac.compare_digest(email.strip().lower(), configured_email.lower())
+        and hmac.compare_digest(password, configured_password)
+    )
+
+
+def render_owner_login():
+    st.title("🔐 Owner Login")
+    st.write("Sign in to review account activity and submitted news claims.")
+    configured_email, configured_password = owner_credentials()
+    if not configured_email or not configured_password:
+        st.error(
+            "Owner login is not configured. Add OWNER_EMAIL and OWNER_PASSWORD "
+            "to Streamlit Secrets before using this page."
+        )
+        return
+
+    with st.form("owner_login_form"):
+        email = st.text_input("Owner email")
+        password = st.text_input("Owner password", type="password")
+        submitted = st.form_submit_button("Owner Login", type="primary",
+                                          use_container_width=True)
+    if submitted:
+        if authenticate_owner(email, password):
+            st.session_state.owner_authenticated = True
+            st.session_state.user = None
+            st.session_state.page = "Owner Dashboard"
+            st.rerun()
+        else:
+            st.error("Incorrect owner email or password.")
+
+
+def render_owner_dashboard():
+    st.title("🛡️ Owner Dashboard")
+    st.caption(
+        "Review submitted claims and the app's model/search outputs. "
+        "These outputs do not automatically establish whether a claim is true."
+    )
+
+    with get_connection() as conn:
+        user_count = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+        analysis_count = conn.execute(
+            "SELECT COUNT(*) FROM news_history"
+        ).fetchone()[0]
+        rows = conn.execute("""
+            SELECT
+                news_history.id AS analysis_id,
+                users.name AS user_name,
+                users.email AS user_email,
+                news_history.news_text AS news_text,
+                news_history.prediction AS prediction,
+                news_history.sources_json AS sources_json,
+                news_history.searched_web AS searched_web,
+                news_history.created_at AS created_at
+            FROM news_history
+            JOIN users ON users.id = news_history.user_id
+            ORDER BY news_history.id DESC
+        """).fetchall()
+        users = conn.execute("""
+            SELECT id, name, email, created_at
+            FROM users
+            ORDER BY id DESC
+        """).fetchall()
+
+    col1, col2 = st.columns(2)
+    col1.metric("Registered users", user_count)
+    col2.metric("Saved analyses", analysis_count)
+
+    st.subheader("Registered users")
+    if users:
+        st.dataframe(
+            [{"Name": r["name"], "Email": r["email"],
+              "Joined (UTC)": r["created_at"]} for r in users],
+            use_container_width=True,
+            hide_index=True,
+        )
+    else:
+        st.info("No registered users yet.")
+
+    st.subheader("User search and analysis review")
+    search_filter = st.text_input(
+        "Filter by email or claim text",
+        placeholder="Enter an email address or a phrase from a claim",
+    ).strip().lower()
+
+    visible_rows = []
+    for r in rows:
+        if search_filter and (
+            search_filter not in str(r["user_email"]).lower()
+            and search_filter not in str(r["news_text"]).lower()
+        ):
+            continue
+        try:
+            sources = json.loads(r["sources_json"] or "[]")
+        except (json.JSONDecodeError, TypeError):
+            sources = []
+        visible_rows.append({
+            "Analysis ID": r["analysis_id"],
+            "Date (UTC)": r["created_at"],
+            "User": r["user_name"],
+            "Email": r["user_email"],
+            "Submitted claim": r["news_text"],
+            "Model prediction": r["prediction"] or "Unavailable",
+            "Web search enabled": bool(r["searched_web"]),
+            "Sources found": len(sources),
+        })
+
+    if visible_rows:
+        st.dataframe(visible_rows, use_container_width=True, hide_index=True)
+        csv_data = pd.DataFrame(visible_rows).to_csv(index=False).encode("utf-8")
+        st.download_button(
+            "Download filtered review as CSV",
+            data=csv_data,
+            file_name="truthlens_owner_review.csv",
+            mime="text/csv",
+        )
+    else:
+        st.info("No analyses match this filter.")
+
+    st.subheader("Review details")
+    if rows:
+        # Use the aliases defined in the query above consistently.
+        row_options = {
+            f"#{r['analysis_id']} · {r['created_at']} · {r['user_email']}": r["analysis_id"]
+            for r in rows
+            if not search_filter
+            or search_filter in str(r["user_email"]).lower()
+            or search_filter in str(r["news_text"]).lower()
+        }
+        if row_options:
+            selected_id = st.selectbox("Choose an analysis", list(row_options.keys()))
+            selected = next(
+                r for r in rows if r["analysis_id"] == row_options[selected_id]
+            )
+            st.markdown("**Submitted claim**")
+            st.write(selected["news_text"])
+            st.write(f"**Model prediction:** {selected['prediction'] or 'Unavailable'}")
+            try:
+                sources = json.loads(selected["sources_json"] or "[]")
+            except (json.JSONDecodeError, TypeError):
+                sources = []
+            st.markdown("**Retrieved sources**")
+            if sources:
+                for source in sources:
+                    title = escape(str(source.get("title", "Source")))
+                    url = str(source.get("url", ""))
+                    if looks_like_url(url):
+                        st.markdown(f"- [{title}]({url})")
+                    else:
+                        st.write(f"- {title}")
+                    if source.get("content"):
+                        st.caption(str(source["content"]))
+            else:
+                st.info("No sources were saved for this analysis.")
+            st.warning(
+                "Review the original sources and evidence yourself. "
+                "The model label and search results are not proof of truth."
+            )
+    else:
+        st.info("No saved analyses are available yet.")
+
+
+# =========================================================
 # MODEL AND LIVE SEARCH
 # =========================================================
 
@@ -371,6 +553,9 @@ def do_analysis(
 # SESSION STATE
 # =========================================================
 
+if "owner_authenticated" not in st.session_state:
+    st.session_state.owner_authenticated = False
+
 if "user" not in st.session_state:
     st.session_state.user = None
 
@@ -426,27 +611,30 @@ with st.sidebar:
     st.caption("NLP • Live Search • Source Review")
     st.divider()
 
-    if st.session_state.user:
+    if st.session_state.owner_authenticated:
+        st.success("Signed in as **Owner**")
+        owner_menu = st.radio(
+            "Owner Navigation",
+            ["Owner Dashboard", "Owner Logout"],
+            key="owner_navigation",
+        )
+        if owner_menu == "Owner Logout":
+            st.session_state.owner_authenticated = False
+            st.session_state.page = "Login"
+            st.rerun()
+        else:
+            st.session_state.page = "Owner Dashboard"
+
+    elif st.session_state.user:
         user = st.session_state.user
-
         st.success(f"Signed in as **{user['name']}**")
-
-        # Reset the radio selection after cancelling logout.
         if st.session_state.pop("reset_navigation", False):
             st.session_state["logged_in_navigation"] = "My Dashboard"
-
         menu = st.radio(
             "Navigation",
-            [
-                "My Dashboard",
-                "Analyze News",
-                "My History",
-                "My Profile",
-                "Logout",
-            ],
+            ["My Dashboard", "Analyze News", "My History", "My Profile", "Logout"],
             key="logged_in_navigation",
         )
-
         if menu == "Logout":
             confirm_logout()
         else:
@@ -455,26 +643,21 @@ with st.sidebar:
     else:
         menu = st.radio(
             "Welcome",
-            ["Login", "Create Account"],
+            ["Login", "Create Account", "Owner Login"],
             key="logged_out_navigation",
         )
-
         st.session_state.page = menu
 
     st.divider()
-
     st.markdown("### About TruthLens")
-
     st.write(
         "The NLP model finds learned text patterns; "
         "live search finds related sources."
     )
-
     st.caption(
         "Educational prototype. Model predictions and search "
         "relevance do not prove truth."
     )
-
 
 # =========================================================
 # LOGIN PAGE
@@ -944,8 +1127,12 @@ def render_profile():
 # PAGE ROUTING
 # =========================================================
 
-if not st.session_state.user:
-    if st.session_state.page == "Create Account":
+if st.session_state.owner_authenticated:
+    render_owner_dashboard()
+elif not st.session_state.user:
+    if st.session_state.page == "Owner Login":
+        render_owner_login()
+    elif st.session_state.page == "Create Account":
         render_signup()
     else:
         render_login()
