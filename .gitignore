@@ -1,8 +1,17 @@
 
-# Keep generated model files available for deployment
+# Python virtual environment
+.venv/
+__pycache__/
+*.py[cod]
+
+# Secrets and environment files
+.env
+.streamlit/secrets.toml
+
+# Local database
+truthlens.db
+
+# Allow trained model files for deployment
+models/*
 !models/fake_news_pipeline.joblib
 !models/evaluation_metrics.json
-.venv/
-truthlens.db
-.streamlit/secrets.toml
-.env
