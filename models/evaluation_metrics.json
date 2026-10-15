@@ -1,0 +1,48 @@
+{
+  "dataset_rows_after_cleaning": 20,
+  "training_rows": 16,
+  "test_rows": 4,
+  "accuracy": 1.0,
+  "labels": [
+    "fake",
+    "real"
+  ],
+  "confusion_matrix": [
+    [
+      2,
+      0
+    ],
+    [
+      0,
+      2
+    ]
+  ],
+  "classification_report": {
+    "fake": {
+      "precision": 1.0,
+      "recall": 1.0,
+      "f1-score": 1.0,
+      "support": 2.0
+    },
+    "real": {
+      "precision": 1.0,
+      "recall": 1.0,
+      "f1-score": 1.0,
+      "support": 2.0
+    },
+    "accuracy": 1.0,
+    "macro avg": {
+      "precision": 1.0,
+      "recall": 1.0,
+      "f1-score": 1.0,
+      "support": 4.0
+    },
+    "weighted avg": {
+      "precision": 1.0,
+      "recall": 1.0,
+      "f1-score": 1.0,
+      "support": 4.0
+    }
+  },
+  "note": "Scores apply only to this held-out split and dataset; they do not prove factual truth."
+}

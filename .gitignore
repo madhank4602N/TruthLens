@@ -1,6 +1,8 @@
+
+# Keep generated model files available for deployment
+!models/fake_news_pipeline.joblib
+!models/evaluation_metrics.json
 .venv/
-__pycache__/
-*.pyc
-models/*.joblib
-models/evaluation_metrics.json
-.DS_Store
+truthlens.db
+.streamlit/secrets.toml
+.env

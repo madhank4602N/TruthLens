@@ -52,6 +52,7 @@ def init_db():
                 name TEXT NOT NULL,
                 email TEXT NOT NULL UNIQUE COLLATE NOCASE,
                 password_hash TEXT NOT NULL,
+                is_active INTEGER NOT NULL DEFAULT 1,
                 created_at TEXT NOT NULL DEFAULT (datetime('now'))
             )
         """)
@@ -71,6 +72,14 @@ def init_db():
             )
         """)
 
+        # Backward-compatible migration for databases created before account controls.
+        user_columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(users)").fetchall()
+        }
+        if "is_active" not in user_columns:
+            conn.execute(
+                "ALTER TABLE users ADD COLUMN is_active INTEGER NOT NULL DEFAULT 1"
+            )
         conn.commit()
 
 
@@ -140,14 +149,14 @@ def authenticate_user(email: str, password: str):
     with get_connection() as conn:
         user = conn.execute(
             """
-            SELECT id, name, email, password_hash
+            SELECT id, name, email, password_hash, is_active
             FROM users
             WHERE email = ? COLLATE NOCASE
             """,
             (email.strip(),),
         ).fetchone()
 
-    if user and verify_password(password, user["password_hash"]):
+    if user and user["is_active"] and verify_password(password, user["password_hash"]):
         return {
             "id": user["id"],
             "name": user["name"],
@@ -314,6 +323,47 @@ def render_owner_dashboard():
     col1, col2 = st.columns(2)
     col1.metric("Registered users", user_count)
     col2.metric("Saved analyses", analysis_count)
+
+    st.subheader("User access management")
+    st.caption(
+        "Disable an account to prevent future logins. This does not access or control a user's device."
+    )
+    with get_connection() as conn:
+        managed_users = conn.execute(
+            "SELECT id, name, email, is_active, created_at FROM users ORDER BY id DESC"
+        ).fetchall()
+    if managed_users:
+        st.dataframe(
+            [{"Name": r["name"], "Email": r["email"],
+              "Status": "Active" if r["is_active"] else "Disabled",
+              "Joined (UTC)": r["created_at"]} for r in managed_users],
+            use_container_width=True, hide_index=True,
+        )
+        user_options = {
+            f"{r['name']} · {r['email']} · {'Active' if r['is_active'] else 'Disabled'}": r["id"]
+            for r in managed_users
+        }
+        selected_user_label = st.selectbox(
+            "Select account", list(user_options.keys()), key="managed_user_select"
+        )
+        selected_user_id = user_options[selected_user_label]
+        selected_user = next(r for r in managed_users if r["id"] == selected_user_id)
+        desired_active = st.checkbox(
+            "Allow this account to log in",
+            value=bool(selected_user["is_active"]),
+            key=f"user_active_{selected_user_id}",
+        )
+        if st.button("Save account access", type="primary"):
+            with get_connection() as conn:
+                conn.execute(
+                    "UPDATE users SET is_active = ? WHERE id = ?",
+                    (int(desired_active), selected_user_id),
+                )
+                conn.commit()
+            st.success("Account access updated.")
+            st.rerun()
+    else:
+        st.info("No registered users to manage yet.")
 
     st.subheader("Registered users")
     if users:
@@ -643,7 +693,7 @@ with st.sidebar:
     else:
         menu = st.radio(
             "Welcome",
-            ["Login", "Create Account", "Owner Login"],
+            ["Login", "Create Account"],
             key="logged_out_navigation",
         )
         st.session_state.page = menu
@@ -693,17 +743,23 @@ def render_login():
             st.error("Enter both your email and password.")
 
         else:
-            user = authenticate_user(email, password)
-
-            if user:
-                st.session_state.user = user
-                st.session_state.page = "My Dashboard"
+            # The owner uses the same login form; owner credentials are checked first.
+            if authenticate_owner(email, password):
+                st.session_state.owner_authenticated = True
+                st.session_state.user = None
+                st.session_state.page = "Owner Dashboard"
                 st.session_state.analysis_result = None
-
                 st.rerun()
 
-            else:
-                st.error("Incorrect email or password.")
+            user = authenticate_user(email, password)
+            if user:
+                st.session_state.user = user
+                st.session_state.owner_authenticated = False
+                st.session_state.page = "My Dashboard"
+                st.session_state.analysis_result = None
+                st.rerun()
+            elif not authenticate_owner(email, password):
+                st.error("Incorrect email or password, or this account is disabled.")
 
     st.info(
         "New to TruthLens? Choose **Create Account** "
@@ -1130,9 +1186,7 @@ def render_profile():
 if st.session_state.owner_authenticated:
     render_owner_dashboard()
 elif not st.session_state.user:
-    if st.session_state.page == "Owner Login":
-        render_owner_login()
-    elif st.session_state.page == "Create Account":
+    if st.session_state.page == "Create Account":
         render_signup()
     else:
         render_login()
