@@ -501,6 +501,8 @@ def do_analysis(
     prediction = None
     scores: list[dict[str, Any]] = []
     sources: list[dict[str, str]] = []
+    images: list[dict[str, str]] = []
+    videos: list[dict[str, str]] = []
     pipeline = None
 
     # Load trained NLP model.
@@ -575,19 +577,104 @@ def do_analysis(
                             search_depth="basic",
                             max_results=int(number_of_sources),
                             include_answer=False,
+                            include_images=True,
                         ),
                     )
 
-                for result in response.get("results", []):
-                    sources.append(
-                        {
-                            "title": str(
-                                result.get("title") or "Untitled source"
-                            ),
+                # Validate Tavily's response before reading its fields.
+                # Tavily image entries may be plain URL strings OR dictionaries.
+                if not isinstance(response, dict):
+                    raise TypeError(
+                        f"Unexpected Tavily response type: {type(response).__name__}"
+                    )
+
+                image_items = response.get("images", [])
+                if isinstance(image_items, list):
+                    for image_result in image_items:
+                        if isinstance(image_result, str):
+                            image_url = image_result.strip()
+                            description = "Related image"
+                            image_source_url = ""
+                        elif isinstance(image_result, dict):
+                            image_url = str(
+                                image_result.get("url")
+                                or image_result.get("image_url")
+                                or ""
+                            ).strip()
+                            description = str(
+                                image_result.get("description") or "Related image"
+                            )
+                            image_source_url = str(
+                                image_result.get("source_url")
+                                or image_result.get("source")
+                                or ""
+                            ).strip()
+                        else:
+                            continue
+
+                        if looks_like_url(image_url):
+                            images.append({
+                                "url": image_url,
+                                "description": description,
+                                "source_url": image_source_url,
+                            })
+
+                # Ignore malformed individual entries rather than failing all search.
+                result_items = response.get("results", [])
+                if isinstance(result_items, list):
+                    for result in result_items:
+                        if not isinstance(result, dict):
+                            continue
+                        sources.append({
+                            "title": str(result.get("title") or "Untitled source"),
                             "url": str(result.get("url") or ""),
                             "content": str(result.get("content") or ""),
-                        }
+                        })
+
+                # Run a separate search focused on videos so the user gets
+                # clickable video links rather than only ordinary web pages.
+                try:
+                    video_response = cast(
+                        dict[str, Any],
+                        client.search(
+                            query=f"site:youtube.com/watch OR site:youtu.be {query}",
+                            topic="general",
+                            search_depth="basic",
+                            max_results=min(int(number_of_sources), 5),
+                            include_answer=False,
+                        ),
                     )
+                    seen_video_urls: set[str] = set()
+                    if not isinstance(video_response, dict):
+                        raise TypeError("Unexpected Tavily video response format")
+                    video_items = video_response.get("results", [])
+                    if not isinstance(video_items, list):
+                        video_items = []
+                    for video_result in video_items:
+                        if not isinstance(video_result, dict):
+                            continue
+                        video_url = str(video_result.get("url") or "")
+                        parsed_video_url = urlparse(video_url)
+                        host = (parsed_video_url.hostname or "").lower()
+                        is_video_link = (
+                            host == "youtu.be"
+                            or host.endswith("youtube.com")
+                            or host.endswith("vimeo.com")
+                        )
+                        if (
+                            is_video_link
+                            and looks_like_url(video_url)
+                            and video_url not in seen_video_urls
+                        ):
+                            videos.append({
+                                "title": str(video_result.get("title") or "Related video"),
+                                "url": video_url,
+                                "content": str(video_result.get("content") or ""),
+                            })
+                            seen_video_urls.add(video_url)
+                except Exception:
+                    # Keep ordinary sources available even if video search fails.
+                    pass
 
             except Exception as exc:
                 st.error(f"Web search failed: {exc}")
@@ -596,7 +683,7 @@ def do_analysis(
                     "and account status."
                 )
 
-    return prediction, scores, sources
+    return prediction, scores, sources, images, videos
 
 
 # =========================================================
@@ -932,7 +1019,7 @@ def render_analyze():
             return
 
         with st.spinner("Analysing your claim..."):
-            prediction, scores, sources = do_analysis(
+            prediction, scores, sources, images, videos = do_analysis(
                 claim,
                 search_enabled,
                 number_of_sources,
@@ -952,6 +1039,8 @@ def render_analyze():
             "prediction": prediction,
             "scores": scores,
             "sources": sources,
+            "images": images,
+            "videos": videos,
             "search_enabled": search_enabled,
         }
 
@@ -1053,6 +1142,80 @@ def render_analyze():
             st.info(
                 "No live sources were saved. Check your Tavily API key "
                 "or try another claim."
+            )
+
+
+        # Visual evidence: display small image previews in two columns.
+        st.markdown("#### 🖼️ Related images")
+        images = result.get("images", [])
+
+        if images:
+            for start in range(0, min(len(images), 8), 2):
+                image_columns = st.columns(2)
+
+                for offset, column in enumerate(image_columns):
+                    image_index = start + offset
+
+                    if image_index >= min(len(images), 8):
+                        break
+
+                    image = images[image_index]
+
+                    if not isinstance(image, dict):
+                        continue
+
+                    image_url = str(image.get("url", "")).strip()
+                    description = str(
+                        image.get("description", "Related image")
+                    )
+                    image_source_url = str(
+                        image.get("source_url", "")
+                    ).strip()
+
+                    if not looks_like_url(image_url):
+                        continue
+
+                    with column:
+                        with st.container(border=True):
+                            try:
+                                # Fixed width prevents images filling the page.
+                                st.image(
+                                    image_url,
+                                    caption=description,
+                                    width=150,
+                                )
+                            except Exception:
+                                st.markdown(
+                                    f"[Open image ↗]({image_url})"
+                                )
+
+                            if looks_like_url(image_source_url):
+                                st.caption("Image source:")
+                                st.markdown(
+                                    f"[View original source ↗]"
+                                    f"({image_source_url})"
+                                )
+        else:
+            st.caption(
+                "No image previews were returned for this query. "
+                "Images are supporting context, not proof that a claim is true."
+            )
+
+        # Video evidence: show direct links from the focused video search.
+        st.markdown("#### 🎥 Related videos")
+        videos = result.get("videos", [])
+        if videos:
+            for video in videos:
+                title = escape(str(video.get("title", "Related video")))
+                video_url = str(video.get("url", ""))
+                if looks_like_url(video_url):
+                    st.markdown(f"- [{title}]({video_url})")
+                    if video.get("content"):
+                        st.caption(str(video["content"]))
+        else:
+            st.caption(
+                "No matching video links were found. Try a more specific claim "
+                "or search phrase."
             )
 
         st.divider()
